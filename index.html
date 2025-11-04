@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, user-scalable=no">
+        <title>Garbled Circuit Playground</title>
+        <script src="https://unpkg.com/@cmdcode/tapscript@1.5.3"></script>
+        <script src="https://bundle.run/noble-secp256k1@1.2.14"></script>
+        <script>
+            var demo_garbler = {
+                network: "testnet",
+                nums_point: "a".repeat( 64 ),
+                hexToBytes: hex => Uint8Array.from( hex.match( /.{1,2}/g ).map( byte => parseInt( byte, 16 ) ) ),
+                bytesToHex: bytes => bytes.reduce( ( str, byte ) => str + byte.toString( 16 ).padStart( 2, "0" ), "" ),
+                hexToBase64: hex => btoa( hex.match( /\w{2}/g ).map( a => String.fromCharCode( parseInt( a, 16 ) ) ).join( "" ) ),
+                base64ToBytes: str => {
+                    var raw = atob( str );
+                    var result = [];
+                    var i; for ( i=0; i<raw.length; i++ ) result.push( raw.charCodeAt( i ) );
+                    return new Uint8Array( result );
+                },
+                getPrivkey: () => demo_garbler.bytesToHex( nobleSecp256k1.utils.randomPrivateKey() ),
+                getPubkey: privkey => nobleSecp256k1.getPublicKey( privkey, true ).substring( 2 ),
+                sha256: async s => {
+                    if ( typeof s == "string" ) s = new TextEncoder().encode( s );
+                    var arr = await crypto.subtle.digest( 'SHA-256', s );
+                    return demo_garbler.bytesToHex( new Uint8Array( arr ) );
+                },
+                encrypt: async ( encryption_key, text ) => {
+                    var msg = ( new TextEncoder() ).encode( text );
+                    var iv = window.crypto.getRandomValues( new Uint8Array( 16 ) );
+                    var key_raw = demo_garbler.hexToBytes( encryption_key );
+                    var key = await window.crypto.subtle.importKey(
+                        "raw",
+                        key_raw,
+                        "AES-CBC",
+                        false,
+                        [ "encrypt", "decrypt" ],
+                    );
+                    var emsg = await window.crypto.subtle.encrypt(
+                        {
+                            name: "AES-CBC",
+                            iv,
+                        },
+                        key,
+                        msg,
+                    )
+                    emsg = new Uint8Array( emsg );
+                    var arr = emsg;
+                    emsg = demo_garbler.hexToBase64( demo_garbler.bytesToHex( emsg ) ) + "?iv=" + btoa( String.fromCharCode.apply( null, iv ) );
+                    return emsg;
+                },
+                decrypt: async ( decryption_key, ciphertext ) => {
+                    var [ emsg, iv ] = ciphertext.split( "?iv=" );
+                    var key_raw = demo_garbler.hexToBytes( decryption_key );
+                    var key = await window.crypto.subtle.importKey(
+                        "raw",
+                        key_raw,
+                        "AES-CBC",
+                        false,
+                        [ "encrypt", "decrypt" ],
+                    );
+                    var decrypted = await window.crypto.subtle.decrypt(
+                        {
+                            name: "AES-CBC",
+                            iv: demo_garbler.base64ToBytes( iv ),
+                        },
+                        key,
+                        demo_garbler.base64ToBytes( emsg ),
+                    );
+                    var msg = ( new TextDecoder() ).decode( decrypted );
+                    return msg;
+                },
+                hexToBinary: hex => {
+                    var array_hex = hex.match( /\w{2}/g );
+                    var array_bin = [];
+                    array_hex.forEach( item => array_bin.push( ( parseInt( item, 16 ).toString( 2 ) ).padStart( 8, '0' ) ) );
+                    return array_bin.join( "" );
+                },
+                binaryToHex: binary => {
+                    var array_bin = binary.match( /\w{8}/g );
+                    var array_hex = [];
+                    array_bin.forEach( item => array_hex.push( ( parseInt( item, 2 ).toString( 16 ) ).padStart( 2, '0' ) ) );
+                    return array_hex.join( "" );
+                },
+                xorHexStrings: ( hex_1, hex_2 ) => {
+                    var bin_1 = demo_garbler.hexToBinary( hex_1 );
+                    var bin_2 = demo_garbler.hexToBinary( hex_2 );
+                    var bigger = bin_1.length > bin_2.length ? bin_1 : bin_2;
+                    var smaller = bin_1.length > bin_2.length ? bin_2 : bin_1;
+                    smaller.padStart( bigger.length, "0" );
+                    bin_1 = bin_1.length > bin_2.length ? bigger : smaller;
+                    bin_2 = bin_1.length > bin_2.length ? smaller : bigger;
+                    var arr_1 = bin_1.split( "" );
+                    var arr_2 = bin_2.split( "" );
+                    var arr_3 = [];
+                    arr_1.forEach( ( item, index ) => arr_3.push( String( Number( Number( item ) !== Number( arr_2[ index ] ) ) ) ) );
+                    var bin_3 = arr_3.join( "" );
+                    var hex = demo_garbler.binaryToHex( bin_3, 2 );
+                    var bigger_hex = hex_1.length > hex_2.length ? hex_1 : hex_2;
+                    return hex.padStart( bigger_hex.length, "0" );
+                },
+                getAddressData: ( scripts, index ) => {
+                    var tree = scripts.map( s => tapscript.Tap.encodeScript( s ) );
+                    var [ tpubkey, cblock ] = tapscript.Tap.getPubKey( demo_garbler.nums_point, { tree, target: tree[ index ] });
+                    var address = tapscript.Address.p2tr.fromPubKey( tpubkey, demo_garbler.network );
+                    return [ address, tree, cblock ];
+                },
+                makeGate: async ( type, input_preimages ) => {
+                    if ( !type ) return "error, enter a gate type of AND"
+                    if ( type === "AND" ) {
+                        var logic_table = [
+                            [ 0, 0, 0 ],
+                            [ 0, 1, 0 ],
+                            [ 1, 0, 0 ],
+                            [ 1, 1, 1 ],
+                        ];
+                    }
+                    var six_preimages = [];
+                    if ( !input_preimages ) {
+                        var i; for ( i=0; i<logic_table[ 0 ].length; i++ ) {
+                            var two_preimages = [ demo_garbler.getPrivkey(), demo_garbler.getPrivkey() ];
+                            six_preimages.push( two_preimages );
+                        }
+                    }
+                    var six_hashes = [];
+                    var i; for ( i=0; i<six_preimages.length; i++ ) {
+                        var hash_array = [];
+                        var j; for ( j=0; j<six_preimages[ 0 ].length; j++ ) {
+                            var hash = await demo_garbler.sha256( demo_garbler.hexToBytes( six_preimages[ i ][ j ] ) );
+                            hash_array.push( hash );
+                        }
+                        six_hashes.push( hash_array );
+                    }
+                    var plaintext_lines = [];
+                    logic_table.forEach( ( line, index ) => {
+                        var new_line = [
+                            six_preimages[ 0 ][ line[ 0 ] ],
+                            six_preimages[ 1 ][ line[ 1 ] ],
+                            six_preimages[ 2 ][ line[ 2 ] ],
+                        ];
+                        plaintext_lines.push( new_line );
+                    });
+                    var hash_lines = [];
+                    logic_table.forEach( ( line, index ) => {
+                        var new_line = [
+                            six_hashes[ 0 ][ line[ 0 ] ],
+                            six_hashes[ 1 ][ line[ 1 ] ],
+                            six_hashes[ 2 ][ line[ 2 ] ],
+                        ];
+                        hash_lines.push( new_line );
+                    });
+                    var revealable_lines = [];
+                    // var encrypted_lines = [];
+                    var i; for ( i=0; i<plaintext_lines.length; i++ ) {
+                        var plaintext_line = plaintext_lines[ i ];
+                        var hash_line = hash_lines[ i ];
+                        //concatenate A and B
+                        var encryption_preimage = plaintext_line[ 0 ] + plaintext_line[ 1 ];
+                        //hash the result
+                        var encryption_hash = await demo_garbler.sha256( demo_garbler.hexToBytes( encryption_preimage ) );
+                        //xor the hash with C
+                        var xord_c = demo_garbler.xorHexStrings( plaintext_line[ 2 ], encryption_hash );
+                        revealable_lines.push( [ hash_line[ 0 ], hash_line[ 1 ], hash_line[ 2 ], xord_c ] );
+                        // encrypted_lines.push( [ plaintext_line[ 0 ], plaintext_line[ 1 ], xord_c ] );
+                    }
+                    // console.log( plaintext_lines[ 0 ], revealable_lines[ 0 ] );
+                    return [ plaintext_lines, revealable_lines, six_preimages, six_hashes ];
+                },
+            }
+        </script>
+        <style>
+            * {
+                box-sizing: border-box;
+                font-size: 1.15rem;
+                font-family: Arial, sans-serif;
+            }
+            html {
+                max-width: 800px;
+                padding: 3rem 1rem;
+                margin: auto;
+                line-height: 1.25;
+                padding: 0;
+            }
+            body {
+                margin: 3rem 1rem;
+                word-wrap: break-word;
+            }
+            h1 {
+                font-size: 2rem;
+            }
+            h2 {
+                font-size: 1.5rem;
+            }
+            input {
+                line-height: 1.25;
+                width: 100%;
+                height: 1.8rem;
+                font-size: 1.15rem;
+                border: 1px solid grey;
+            }
+            .hidden {
+                display: none !important;
+            }
+            @media screen and (max-width: 600px) {
+            }
+        </style>
+        <script>
+            var $ = document.querySelector.bind( document );
+            var $$ = document.querySelectorAll.bind( document );
+            var url_params = new URLSearchParams( window.location.search );
+            var url_keys = url_params.keys();
+            var $_GET = {}
+            for ( var key of url_keys ) $_GET[ key ] = url_params.get( key );
+        </script>
+    </head>
+    <body>
+        <div class="home_page">
+            <h1>Welcome to Garbled Circuit Playground</h1>
+            <p>
+                On this page you can experiment with garbled circuits. Specifically, this demo lets you pretend to be two people, Alice and Bob; as both, you will agree on a program to execute; as Alice, you will execute the program, and if you execute it correctly, you will take Bob's money, otherwise he will take yours; as Bob, you will check if Alice executed the program correctly, and if she did not, you will take her money, otherwise she will take yours. Click the button below to get started.
+            </p>
+            <p><button class="lets_play">Let's play</button></p>
+        </div>
+        <div class="circuit_page hidden">
+            <h1>Circuit page</h1>
+            <p>Pick a circuit</p>
+            <p><button class="and_circuit">AND gate</button></p>
+        </div>
+        <script>
+            var alices_priv = demo_garbler.getPrivkey();
+            var alices_pub = demo_garbler.getPubkey( alices_priv );
+            var bobs_priv = demo_garbler.getPrivkey();
+            var bobs_pub = demo_garbler.getPubkey( bobs_priv );
+            var showPage = page => {
+                $( '.home_page' ).classList.add( "hidden" );
+                $( '.circuit_page' ).classList.add( "hidden" );
+                $( `.${page}` ).classList.remove( "hidden" );
+            }
+            $( '.lets_play' ).onclick = () => showPage( 'circuit_page' );
+            $( '.and_circuit' ).onclick = async () => {
+                var forty_copies_of_plaintext_gate = [];
+                var forty_copies_of_revealable_gate = [];
+                var forty_copies_of_preimages = [];
+                var forty_copies_of_hashes = [];
+                var i; for ( i=0; i<40; i++ ) {
+                    var gate = await demo_garbler.makeGate( "AND" );
+                    forty_copies_of_plaintext_gate.push( gate[ 0 ] );
+                    forty_copies_of_revealable_gate.push( gate[ 1 ] );
+                    forty_copies_of_preimages.push( gate[ 2 ] );
+                    forty_copies_of_hashes.push( gate[ 3 ] );
+                }
+                console.log( 'hey verifier, here are the gates and hashes' );
+                console.log( forty_copies_of_revealable_gate );
+                console.log( forty_copies_of_hashes );
+
+                //do the next lines as the verifier
+                //as the verifier, ensure there are 40 copies of the gate
+                if ( forty_copies_of_revealable_gate.length !== 40 ) return;
+                //pick 1 copy at random
+                var pretenders = [];
+                var num_of_copies = forty_copies_of_revealable_gate.length;
+                var index_of_real_gate = Math.floor( Math.random() * num_of_copies );
+                var real_revealable_gate = forty_copies_of_revealable_gate.splice( index_of_real_gate, 1 );
+                console.log( real_revealable_gate, forty_copies_of_revealable_gate );
+                //tell the prover the index of the real gate
+                console.log( 'hey prover, here is the index of the real logic gate' );
+                console.log( index_of_real_gate );
+
+                //do the next lines as the prover
+                //as the prover, prove the validity of every line of every logic gate except the real one
+                var real_plaintext_gate = forty_copies_of_plaintext_gate.splice( index_of_real_gate, 1 );
+                var real_preimages = forty_copies_of_preimages.splice( index_of_real_gate, 1 );
+                var real_hashes = forty_copies_of_hashes.splice( index_of_real_gate, 1 );
+                var preimages_to_reveal = [];
+                forty_copies_of_preimages.forEach( preimages => preimages_to_reveal.push( [ preimages[ 0 ], preimages[ 1 ] ] ) );
+                console.log( 'hey verifier, here are the preimages that prove the validity of every logic gate except the real one' );
+                console.log( preimages_to_reveal );
+
+                //do the next lines as the verifier
+                //as the verifier, ensure the validity of all the logic gates except the real one
+                var j; for ( j=0; j<forty_copies_of_revealable_gate.length; j++ ) {
+                    var gate_to_check = forty_copies_of_revealable_gate[ j ];
+                    var its_preimage_pairs = preimages_to_reveal[ j ];
+                    var i; for ( i=0; i<4; i++ ) {
+                        var line_to_check = i;
+                        var line = gate_to_check[ line_to_check ];
+                        var p_A0 = its_preimage_pairs[ 0 ][ 0 ];
+                        var p_A1 = its_preimage_pairs[ 0 ][ 1 ];
+                        var p_B0 = its_preimage_pairs[ 1 ][ 0 ];
+                        var p_B1 = its_preimage_pairs[ 1 ][ 1 ];
+                        if ( p_A0.length !== 64 ) return;
+                        if ( p_A1.length !== 64 ) return;
+                        if ( p_B0.length !== 64 ) return;
+                        if ( p_A1.length !== 64 ) return;
+                        if ( line_to_check === 0 ) {
+                            var encryption_preimage = p_A0 + p_B0;
+                            var encryption_hash = await demo_garbler.sha256( demo_garbler.hexToBytes( encryption_preimage ) );
+                            var original_c = demo_garbler.xorHexStrings( line[ 3 ], encryption_hash );
+                            var real_hash_of_c = await demo_garbler.sha256( demo_garbler.hexToBytes( original_c ) );
+                            var expected_hash_of_c = line[ 2 ];
+                            if ( real_hash_of_c !== expected_hash_of_c ) return;
+                        }
+                        if ( line_to_check === 1 ) {
+                            var encryption_preimage = p_A0 + p_B1;
+                            var encryption_hash = await demo_garbler.sha256( demo_garbler.hexToBytes( encryption_preimage ) );
+                            var original_c = demo_garbler.xorHexStrings( line[ 3 ], encryption_hash );
+                            var real_hash_of_c = await demo_garbler.sha256( demo_garbler.hexToBytes( original_c ) );
+                            var expected_hash_of_c = line[ 2 ];
+                            if ( real_hash_of_c !== expected_hash_of_c ) return;
+                        }
+                        if ( line_to_check === 2 ) {
+                            var encryption_preimage = p_A1 + p_B0;
+                            var encryption_hash = await demo_garbler.sha256( demo_garbler.hexToBytes( encryption_preimage ) );
+                            var original_c = demo_garbler.xorHexStrings( line[ 3 ], encryption_hash );
+                            var real_hash_of_c = await demo_garbler.sha256( demo_garbler.hexToBytes( original_c ) );
+                            var expected_hash_of_c = line[ 2 ];
+                            if ( real_hash_of_c !== expected_hash_of_c ) return;
+                        }
+                        if ( line_to_check === 3 ) {
+                            var encryption_preimage = p_A1 + p_B1;
+                            var encryption_hash = await demo_garbler.sha256( demo_garbler.hexToBytes( encryption_preimage ) );
+                            var original_c = demo_garbler.xorHexStrings( line[ 3 ], encryption_hash );
+                            var real_hash_of_c = await demo_garbler.sha256( demo_garbler.hexToBytes( original_c ) );
+                            var expected_hash_of_c = line[ 2 ];
+                            if ( real_hash_of_c !== expected_hash_of_c ) return;
+                        }
+                    }
+                }
+                console.log( 'made it here, meaning all gates are valid!' );
+
+                var assert_scripts = [
+                    [
+                        //ensure Alice and Bob agree on the destination of funds
+                        alices_pub,
+                        "OP_CHECKSIGVERIFY",
+                        bobs_pub,
+                        "OP_CHECKSIGVERIFY",
+                        //ensure the first preimage matches one of the hashes representing the first input
+                        "OP_SHA256",
+                        "OP_DUP",
+                        real_hashes[ 0 ][ 0 ][ 0 ],
+                        "OP_EQUAL",
+                        "OP_SWAP",
+                        real_hashes[ 0 ][ 0 ][ 1 ],
+                        "OP_EQUAL",
+                        "OP_ADD",
+                        "OP_1",
+                        "OP_EQUALVERIFY",
+                        //ensure the second preimage matches one of the hashes representing the second input
+                        "OP_SHA256",
+                        "OP_DUP",
+                        real_hashes[ 0 ][ 1 ][ 0 ],
+                        "OP_EQUAL",
+                        "OP_SWAP",
+                        real_hashes[ 0 ][ 1 ][ 1 ],
+                        "OP_EQUAL",
+                        "OP_ADD",
+                        "OP_1",
+                        "OP_EQUALVERIFY",
+                        "OP_1",
+                    ],
+                    //Otherwise, Alice gets the money after 10 blocks
+                    [
+                        10,
+                        "OP_CHECKSEQUENCEVERIFY",
+                        "OP_DROP",
+                        alices_pub,
+                        "OP_CHECKSIG",
+                    ],
+                ];
+
+                var final_scripts = [
+                    //Alice gets the money if she learns the False preimage for the final logic gate
+                    [
+                        "OP_SHA256",
+                        real_hashes[ 0 ][ 2 ][ 0 ],
+                        "OP_EQUALVERIFY",
+                        alices_pub,
+                        "OP_CHECKSIG",
+                    ],
+                    //Otherwise, Bob gets the money after 10 blocks
+                    [
+                        10,
+                        "OP_CHECKSEQUENCEVERIFY",
+                        "OP_DROP",
+                        bobs_pub,
+                        "OP_CHECKSIG",
+                    ],
+                ];
+
+                //derive the relevant bitcoin addresses
+                var [ assert_addy, assert_tree, assert_cblock ] = demo_garbler.getAddressData( assert_scripts, 0 );
+                var [ final_addy, final_tree, final_cblock ] = demo_garbler.getAddressData( final_scripts, 1 );
+
+                var alices_addy = tapscript.Address.fromScriptPubKey( [ 1, alices_pub ], demo_garbler.network );
+                console.log( `send 10,000 or more sats to this address, which belongs to Alice:` );
+                console.log( alices_addy );
+                var txid_1 = prompt( `send 10,000 or more sats to Alice's address (it's in your console) and enter the txid` );
+                var vout_1 = Number( prompt( `and the vout` ) );
+                var amnt_1 = Number( prompt( `and the amount` ) );
+                var bobs_addy = tapscript.Address.fromScriptPubKey( [ 1, bobs_pub ], demo_garbler.network );
+                console.log( `send 10,000 or more sats to this address, which belongs to Bob:` );
+                console.log( bobs_addy );
+                var txid_2 = prompt( `send 10,000 or more sats to Bob's address (it's in your console) and enter the txid` );
+                var vout_2 = Number( prompt( `and the vout` ) );
+                var amnt_2 = Number( prompt( `and the amount` ) );
+
+                //prepare to fund the assert addy
+                var txfee = 500;
+                var coinjoin_tx = tapscript.Tx.create({
+                    vin: [{
+                        txid: txid_1,
+                        vout: vout_1,
+                        prevout: {
+                            value: amnt_1,
+                            scriptPubKey: tapscript.Address.toScriptPubKey( alices_addy ),
+                        },
+                    },{
+                        txid: txid_2,
+                        vout: vout_2,
+                        prevout: {
+                            value: amnt_2,
+                            scriptPubKey: tapscript.Address.toScriptPubKey( bobs_addy ),
+                        },
+                    }],
+                    vout: [{
+                        value: amnt_1 + amnt_2 - txfee,
+                        scriptPubKey: tapscript.Address.toScriptPubKey( assert_addy ),
+                    }],
+                });
+
+                //prepare to fund the final addy
+                var txfee = 1000;
+                var coinjoin_txid = tapscript.Tx.util.getTxid( coinjoin_tx );
+                var to_final_tx = tapscript.Tx.create({
+                    vin: [{
+                        txid: coinjoin_txid,
+                        vout: 0,
+                        prevout: coinjoin_tx.vout[ 0 ],
+                    }],
+                    vout: [{
+                        value: coinjoin_tx.vout[ 0 ].value - txfee,
+                        scriptPubKey: tapscript.Address.toScriptPubKey( final_addy ),
+                    }],
+                });
+
+                //sign the tx that moves the money into the final addy
+                var alices_sig = tapscript.Signer.taproot.sign( alices_priv, to_final_tx, 0, {extension: assert_tree[ 0 ] });
+                var bobs_sig = tapscript.Signer.taproot.sign( bobs_priv, to_final_tx, 0, {extension: assert_tree[ 0 ] });
+                var bob_wins = confirm( `Click okay if you want Bob to play honestly such that he wins Alice's money; click cancel if you want him to play dishonestly such that Alice wins Bob's money.` );
+                var real_preimage_pairs = real_preimages[ 0 ];
+                if ( bob_wins ) {
+                    var final_preimages = [ real_preimage_pairs[ 1 ][ 1 ], real_preimage_pairs[ 0 ][ 1 ] ];
+                } else {
+                    var final_preimages = [ real_preimage_pairs[ 1 ][ 1 ], real_preimage_pairs[ 0 ][ 0 ] ];
+                }
+                to_final_tx.vin[ 0 ].witness = [ ...final_preimages, bobs_sig, alices_sig, assert_scripts[ 0 ], assert_cblock ];
+                var to_final_txhex = tapscript.Tx.encode( to_final_tx ).hex;
+
+                //sign the final tx
+                var alices_sig = tapscript.Signer.taproot.sign( alices_priv, coinjoin_tx, 0 );
+                var bobs_sig = tapscript.Signer.taproot.sign( bobs_priv, coinjoin_tx, 1 );
+                coinjoin_tx.vin[ 0 ].witness = [ alices_sig ];
+                coinjoin_tx.vin[ 1 ].witness = [ bobs_sig ];
+                var coinjoin_txhex = tapscript.Tx.encode( coinjoin_tx ).hex;
+
+                //broadcast the funding tx
+                console.log( 'broadcast this funding tx:' );
+                console.log( coinjoin_txhex );
+
+                //if necessary, broadcast the to_final tx
+                console.log( 'broadcast this to_final tx:' );
+                console.log( to_final_txhex );
+
+                //as alice, check which preimages Bob revealed
+                var first_preimage = tapscript.Tx.decode( to_final_txhex ).vin[ 0 ].witness[ 1 ];
+                var second_preimage = tapscript.Tx.decode( to_final_txhex ).vin[ 0 ].witness[ 0 ];
+
+                //derive the secret of the final output
+                var first_hash = await demo_garbler.sha256( demo_garbler.hexToBytes( first_preimage ) );
+                var second_hash = await demo_garbler.sha256( demo_garbler.hexToBytes( second_preimage ) );
+                var first_input = first_hash === real_hashes[ 0 ][ 0 ][ 0 ] ? 0 : 1;
+                var second_input = second_hash === real_hashes[ 0 ][ 1 ][ 0 ] ? 0 : 1;
+                if ( !first_input && !second_input ) var line_to_check = 0;
+                if ( !first_input && second_input ) var line_to_check = 1;
+                if ( first_input && !second_input ) var line_to_check = 2;
+                if ( first_input && second_input ) var line_to_check = 3;
+                var line = real_revealable_gate[ 0 ][ line_to_check ];
+                var encryption_preimage = first_preimage + second_preimage;
+                var encryption_hash = await demo_garbler.sha256( demo_garbler.hexToBytes( encryption_preimage ) );
+                var original_c = demo_garbler.xorHexStrings( line[ 3 ], encryption_hash );
+
+                //check if it lets Alice take the money
+                var real_hash_of_c = await demo_garbler.sha256( demo_garbler.hexToBytes( original_c ) );
+                var alice_can_take_the_money = real_hash_of_c === real_hashes[ 0 ][ 2 ][ 0 ];
+                console.log( "alice_can_take_the_money, right?", alice_can_take_the_money );
+
+                if ( alice_can_take_the_money ) {
+                    //if so, as Alice, take the money immediately
+                    var txfee = 500;
+                    var [ final_addy, final_tree, final_cblock ] = demo_garbler.getAddressData( final_scripts, 0 );
+                    var to_final_txid = tapscript.Tx.util.getTxid( to_final_tx );
+                    var sweep_tx = tapscript.Tx.create({
+                        vin: [{
+                            txid: to_final_txid,
+                            vout: 0,
+                            prevout: to_final_tx.vout[ 0 ],
+                        }],
+                        vout: [{
+                            value: to_final_tx.vout[ 0 ].value - txfee,
+                            scriptPubKey: tapscript.Address.toScriptPubKey( alices_addy ),
+                        }],
+                    });
+
+                    //sign the sweep tx
+                    var alices_sig = tapscript.Signer.taproot.sign( alices_priv, sweep_tx, 0, {extension: final_tree[ 0 ] });
+                    sweep_tx.vin[ 0 ].witness = [ alices_sig, original_c, final_scripts[ 0 ], final_cblock ];
+                    var sweep_txhex = tapscript.Tx.encode( sweep_tx ).hex;
+
+                    //broadcast the sweep tx
+                    console.log( `broadcast Alice's sweep tx:` );
+                    console.log( sweep_txhex );
+                } else {
+                    //otherwise, as Bob, take the money after 10 blocks
+                    var txfee = 500;
+                    var [ final_addy, final_tree, final_cblock ] = demo_garbler.getAddressData( final_scripts, 1 );
+                    var to_final_txid = tapscript.Tx.util.getTxid( to_final_tx );
+                    var sweep_tx = tapscript.Tx.create({
+                        vin: [{
+                            txid: to_final_txid,
+                            vout: 0,
+                            prevout: to_final_tx.vout[ 0 ],
+                            sequence: 10,
+                        }],
+                        vout: [{
+                            value: to_final_tx.vout[ 0 ].value - txfee,
+                            scriptPubKey: tapscript.Address.toScriptPubKey( bobs_addy ),
+                        }],
+                    });
+
+                    //sign the sweep tx
+                    var bobs_sig = tapscript.Signer.taproot.sign( bobs_priv, sweep_tx, 0, {extension: final_tree[ 1 ] });
+                    sweep_tx.vin[ 0 ].witness = [ bobs_sig, final_scripts[ 1 ], final_cblock ];
+                    var sweep_txhex = tapscript.Tx.encode( sweep_tx ).hex;
+
+                    //broadcast the sweep tx
+                    console.log( `broadcast Bob's sweep tx:` );
+                    console.log( sweep_txhex );
+                }
+            }
+        </script>
+    </body>
+</html>
